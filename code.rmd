@@ -1,0 +1,355 @@
+---
+title: "90904 Final Project"
+author: "Prithvi Acharya"
+date: "April 27, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#install.packages("knitr")
+#install.packages("dplyr")
+#install.packages("readr")
+#install.packages("neuralnet")
+#install.packages("lubridate")
+#install.packages("caret")
+#install.packages("randomForest")
+library(knitr)
+library(ModelMetrics)
+library(dplyr)
+library(readr)
+library(neuralnet)
+library(lubridate)
+library(randomForest)
+library(caret)
+rm(list = ls())
+setwd("C:/Users/prith/OneDrive/Documents/EPP/Courses/Spring 2018/90904/proj/")
+
+```
+
+```{r split-files, eval = F}
+
+#read in raw data to a dataframe
+data <- read_csv("EMS_Incident_Dispatch_Data.csv",
+col_types = cols(FIRST_ACTIVATION_DATETIME = col_datetime(format = "%m/%d/%Y %H:%M:%S %p"),
+                 FIRST_ASSIGNMENT_DATETIME = col_datetime(format = "%m/%d/%Y %H:%M:%S %p"),
+                 FIRST_HOSP_ARRIVAL_DATETIME = col_datetime(format = "%m/%d/%Y %H:%M:%S %p"),
+                 FIRST_ON_SCENE_DATETIME = col_datetime(format = "%m/%d/%Y %H:%M:%S %p"),
+                 FIRST_TO_HOSP_DATETIME = col_datetime(format = "%m/%d/%Y %H:%M:%S %p"),
+                 INCIDENT_DATETIME = col_datetime(format = "%m/%d/%Y %H:%M:%S %p")))
+
+
+# filter out per assumptions in Section 3.1 (Cohort Selection)
+data$VALID_DISPATCH_RSPNS_TIME_INDC <- (data$VALID_DISPATCH_RSPNS_TIME_INDC == 'Y')*1
+data$VALID_INCIDENT_RSPNS_TIME_INDC <- (data$VALID_INCIDENT_RSPNS_TIME_INDC == 'Y')*1
+data <- filter(data, data$VALID_DISPATCH_RSPNS_TIME_INDC == 1 &
+                 data$VALID_INCIDENT_RSPNS_TIME_INDC == 1)
+
+data <- filter(data,
+               data$INCIDENT_RESPONSE_SECONDS_QY <= 1800,
+               data$INCIDENT_RESPONSE_SECONDS_QY > 0)
+
+# filter out data for 2016
+n <- rowSums(is.na(data) == T)
+data <- filter(data,n==0)
+cal_yr <- year(data$INCIDENT_DATETIME)
+data <- filter(data, cal_yr > 2015)
+
+#read in demographic statistics
+dem <- read_csv("Demographic_Statistics_By_Zip_Code.csv")
+dem <- dem[,c(1,4,6,12,14,16,18,20,22,24,26,30,32,40,42)]
+dc <- colnames(dem)
+dc <- make.names(dc, unique=TRUE)
+dc[1] <- "ZIPCODE"
+colnames(dem) <- dc
+rm(dc)
+a <- data$ZIPCODE %in% dem$ZIPCODE
+data <- filter(data, a == TRUE)
+rm(a)
+
+#merge the two dataframes
+data <- left_join(data,dem)
+rm(dem)
+
+#split  into 50-train, 30-tune, 20-test.
+
+blocks <- rep(c(1:10),length.out= nrow(data))
+set.seed(3)
+blocks <- sample (blocks)
+cn <- colnames(data)
+train.50 <- filter(data,blocks <= 5)
+tune.30 <- filter(data, blocks >= 6 & blocks <= 8)
+test.20 <- filter(data, blocks >= 9)
+rm(data,blocks)
+
+write.csv(train.50, 
+          file = "train_50.csv",
+          row.names = F,
+          append = F)
+write.csv(tune.30, 
+          file = "tune_30.csv",
+          row.names = F,
+          append = F)
+
+write.csv(test.20, 
+          file = "test_20.csv",
+          row.names = F,
+          append = F)
+rm(test.20,tune.30)
+
+```
+
+## Descriptive Statistics
+```{r transfrm, eval = F}
+
+# Looking at the Y-Variable
+par(mfrow = c(1,2))
+hist(data$INCIDENT_RESPONSE_SECONDS_QY,
+     breaks = "FD",
+     xlab = "Incident Response Time (s)",
+     xlim = c(0,1800),
+     main = "")
+hist(log(data$INCIDENT_RESPONSE_SECONDS_QY),
+     breaks = "Scott",
+     xlab = "Log of [Incident Response Time (s)]",
+     xlim = c(4.5,7.5),
+     main = "")
+
+t <- xtable(t(summary(data[,c(4,6,9,13,14,33:46)])))
+
+plot(data$INCIDENT_TRAVEL_TM_SECONDS_QY,data$INCIDENT_RESPONSE_SECONDS_QY,
+     main = "", xlab = "Travel Time (s)", ylab ="Response Time (s)")
+line(lowess(data$INCIDENT_TRAVEL_TM_SECONDS_QY,data$INCIDENT_RESPONSE_SECONDS_QY), col = "green")
+
+
+```
+
+
+## Model -  Linear Regression
+```{r linear}
+
+#uploading the 50% dataset for training
+setwd("C:/Users/prith/OneDrive/Documents/EPP/Courses/Spring 2018/90904/proj/")
+train.50 <- read_csv("train_50.csv")
+d <- hour(train.50$INCIDENT_DATETIME) +
+  (minute(train.50$INCIDENT_DATETIME)/60) + 
+  (second(train.50$INCIDENT_DATETIME)/3600)
+
+#Converting Variables as discussed in Section 3.3 - Feature Choices
+train.50$TIME_OF_DAY <- cos(d/366)
+train.50$MONTH <- cos(month(train.50$INCIDENT_DATETIME)/12)
+train.50$ZIPCODE <- as.factor(train.50$ZIPCODE)
+
+train.50 <- filter(train.50,is.na(log(train.50$INCIDENT_TRAVEL_TM_SECONDS_QY))== FALSE)
+xnam <- colnames(train.50[,c(4,20,23,33:48)])
+ n <- rowSums(is.na(train.50[,xnam]))
+train.50 <- filter(train.50,
+      train.50$INCIDENT_RESPONSE_SECONDS_QY > 0 &
+        n == 0 &
+        train.50$INCIDENT_TRAVEL_TM_SECONDS_QY > 0)
+
+#selecting two sets of regressors - with and without "travel time"
+fml.a <- as.formula(paste0("log(INCIDENT_RESPONSE_SECONDS_QY) ~ log(INCIDENT_TRAVEL_TM_SECONDS_QY) + ",paste(xnam,collapse= "+")))
+fml.wo <- as.formula(paste("log(INCIDENT_RESPONSE_SECONDS_QY) ~ ",paste(xnam,collapse= "+")))
+
+#building the first linear model
+linear <- lm(fml.a, data = train.50)
+#let's look at variable importance now
+v <- varImp(linear)
+v <- cbind(as.character(rownames(v)),v)
+colnames(v) <- c("Parameter","Score")
+rownames(v) <- c(1:nrow(v))
+v <- v[order(-v$Score),]
+xtable(v)
+
+#building the second linear model and doing the same thing
+linear.wo <- lm(fml.wo, data = train.50)
+v2 <- varImp(linear.wo)
+v2 <- cbind(as.character(rownames(v2)),v2)
+colnames(v2) <- c("Parameter","Score")
+rownames(v2) <- c(1:nrow(v2))
+v2 <- v2[order(-v2$Score),]
+
+# building the third linear model
+xnam2 <- xnam[c(1,3,2,18,19)]
+fml.b <- as.formula(paste("log(INCIDENT_RESPONSE_SECONDS_QY) ~ ",paste(xnam2,collapse= "+")))
+linearsparse <- lm(fml.b, data = train.50)
+
+#loading the tuning set and transforming variables as needed
+tune.30 <- read_csv("tune_30.csv")
+d <- hour(tune.30$INCIDENT_DATETIME) +
+  (minute(tune.30$INCIDENT_DATETIME)/60) + 
+  (second(tune.30$INCIDENT_DATETIME)/3600)
+tune.30$TIME_OF_DAY <- cos(d/366)
+tune.30$MONTH <- cos(month(tune.30$INCIDENT_DATETIME)/12)
+ n <- rowSums(is.na(tune.30[,c(4,14,20,23,33:42,45:48)]))
+tune.30 <- filter(tune.30,
+      tune.30$INCIDENT_RESPONSE_SECONDS_QY > 0 &
+        n == 0 &
+        tune.30$INCIDENT_TRAVEL_TM_SECONDS_QY > 0)
+tune.30$ZIPCODE <- as.factor(tune.30$ZIPCODE)
+tune.30 <- filter(tune.30,is.na(log(tune.30$INCIDENT_TRAVEL_TM_SECONDS_QY)) == FALSE)
+
+#evaluating the three models
+#y hat values are predicted y values
+y <- log(tune.30$INCIDENT_RESPONSE_SECONDS_QY)
+yhat.linear <- predict(linear,newdata = tune.30)
+yhat.linearsparse <- predict(linearsparse, 
+                             newdata = tune.30)
+yhat.linearwo <- predict(linear.wo,
+                         newdata = tune.30)
+rm(linear,linear.wo,linearsparse)
+
+#calculating rMSE
+
+errors <- c(rmse(y,yhat.linear),
+            rmse(y,yhat.linearwo),
+            rmse(y,yhat.linearsparse))
+errors <- cbind(c("Model 1","Model 2","Model 3"),errors)
+colnames(errors) <- c("Model","rMSE")
+
+```
+
+```{r randFor}
+## Model  - Random Forest
+fml.rf1 <- as.formula(paste("log(INCIDENT_RESPONSE_SECONDS_QY) ~ ",
+                            paste(xnam[c(1,4:19)],collapse= "+")))
+
+# Ensemble model with 50 trees
+rf1 <- randomForest(fml.rf1,
+                    data = train.50,
+                    ntree = 50)
+
+#predicting on tune set
+yhat.rf1 <- predict(rf1, newdata = tune.30)
+rmse.rf1 <- rmse(y,yhat.rf1)
+
+#plotting
+p1 <- plot(rf1)
+p1
+
+rm(rf1,yhat.rf1)
+```
+
+```{r neuralnet}
+
+## Model Neuralnet
+#scaling the x and y variables
+y.nn <- scale(y)
+xnam.nn <- xnam[c(1,4:19)]
+train.50.nn <- train.50[,c(xnam.nn,
+            "INCIDENT_RESPONSE_SECONDS_QY",
+            "INCIDENT_TRAVEL_TM_SECONDS_QY")]
+
+g <- is.na(log(train.50.nn$INCIDENT_RESPONSE_SECONDS_QY))
+train.50.nn <- filter(train.50.nn,g == 0)
+g <- is.na(log(train.50.nn$INCIDENT_TRAVEL_TM_SECONDS_QY))
+train.50.nn <- filter(train.50.nn,g == 0)
+train.50.nn <- scale(train.50.nn)
+train.50.nn <- as.data.frame(train.50.nn)
+tune.30.nn <- tune.30[,c(xnam.nn,
+            "INCIDENT_RESPONSE_SECONDS_QY",
+            "INCIDENT_TRAVEL_TM_SECONDS_QY")]
+
+g <- is.na(log(tune.30.nn$INCIDENT_RESPONSE_SECONDS_QY))
+tune.30.nn <- filter(tune.30.nn,g == 0)
+g <- is.na(log(tune.30.nn$INCIDENT_TRAVEL_TM_SECONDS_QY))
+tune.30.nn <- filter(tune.30.nn,g == 0)
+tune.30.nn <- scale(tune.30.nn)
+tune.30.nn <- as.data.frame(tune.30.nn)
+
+#building the model
+fml.nn <- as.formula(paste("log(INCIDENT_RESPONSE_SECONDS_QY) ~  ",
+                           paste(xnam.nn,collapse= "+")))
+
+nn.model <- neuralnet(fml.nn,
+                      data= train.50.nn,
+                      hidden = 2,
+                      stepmax = 10000,
+                      rep = 3,
+                      linear.output = TRUE,
+                      threshold = 100)
+#predicting and plotting
+
+yhat.nn <- compute(nn.model,tune.30.nn[,c(1:17)],rep = 3)
+yhat.nn <- yhat.nn$net.result
+y.nn <- tune.30.nn$INCIDENT_RESPONSE_SECONDS_QY
+
+rmse.nn <- rmse(y.nn,yhat.nn)
+```
+
+```{r final-pred}
+#new training set combines train and tune sets
+train.80 <- rbind(train.50,tune.30)
+
+#loading and cleaning test set.
+test.20 <- read_csv("test_20.csv")
+d <- hour(test.20$INCIDENT_DATETIME) +
+  (minute(test.20$INCIDENT_DATETIME)/60) + 
+  (second(test.20$INCIDENT_DATETIME)/3600)
+
+#Converting Variables as discussed in Section 3.3 - Feature Choices
+test.20$TIME_OF_DAY <- cos(d/366)
+test.20$MONTH <- cos(month(test.20$INCIDENT_DATETIME)/12)
+test.20$ZIPCODE <- as.factor(test.20$ZIPCODE)
+
+test.20 <- filter(test.20,is.na(log(test.20$INCIDENT_TRAVEL_TM_SECONDS_QY))== FALSE)
+xnam <- colnames(test.20[,c(4,20,23,33:48)])
+n <- rowSums(is.na(test.20[,xnam]))
+test.20 <- filter(test.20,
+                  test.20$INCIDENT_RESPONSE_SECONDS_QY > 0 &
+                    n == 0 &
+                    test.20$INCIDENT_TRAVEL_TM_SECONDS_QY > 0)
+
+y <- log(test.20$INCIDENT_RESPONSE_SECONDS_QY)
+
+#rebuilding the three models
+finalmodel1 <- lm(fml.a, data = train.80)
+yhat1 <- predict(finalmodel1, newdata = test.20)
+rm(finalmodel1)
+
+finalmodel2 <- lm(fml.wo, data = train.80)
+yhat2 <- predict(finalmodel2, newdata = test.20)
+rm(finalmodel2)
+
+finalmodel4 <- randomForest(fml.rf1,
+                            data = train.80,
+                            ntree = 50)
+yhat4 <- predict(finalmodel4, newdata = test.20)
+
+
+#calculating and plotting RMSE/model performance
+rmsefinal <-c(rmse(y,yhat1),rmse(y,yhat2),rmse(y,yhat4))
+rmsefinal <- cbind(c("Model 1","Model 2","Model 3"),rmsefinal)
+
+png('preds.png')
+par(mfrow = c(1,3))
+plot(y,yhat1,
+     xlab="Actual Value - log(Response Time)",
+     ylab = "Predicted Value",
+     xlim = c(2,max(c(y,yhat1))),
+     main = "Model 1",
+     ylim = c(2,max(c(y,yhat1))))
+abline(0,1,col = "blue",lwd = 2)
+
+plot(y,yhat2,
+     xlab="Actual Value - log(Response Time)",
+     ylab = "Predicted Value",
+     xlim = c(2,max(c(y,yhat2))),
+     main = "Model 2",
+     ylim = c(2,max(c(y,yhat2))))
+abline(0,1,col = "blue",lwd = 2)
+
+plot(y,yhat4,
+     xlab="Actual Value - log(Response Time)",
+     ylab = "Predicted Value",
+     xlim = c(2,max(c(y,yhat2))),
+     main = "Model 4",
+     ylim = c(2,max(c(y,yhat2))))
+abline(0,1,col = "blue",lwd = 2)
+dev.off()
+
+xtable(rmsefinal, digits = 4, 
+       caption = "rMSE of Prediction on Final 20%")
+
+```
+
